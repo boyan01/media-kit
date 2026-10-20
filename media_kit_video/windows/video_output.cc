@@ -206,7 +206,10 @@ void VideoOutput::Render() {
       size_t pitch = 4 * static_cast<size_t>(size[0]);
       mpv_render_param params[]{
           {MPV_RENDER_PARAM_SW_SIZE, size},
-          {MPV_RENDER_PARAM_SW_FORMAT, "rgb0"},
+          // Flutter uploads the buffer as RGBA, so the 4th byte must be an
+          // opaque alpha; "rgb0" leaves it 0 & the frame blends with the
+          // widgets behind the texture.
+          {MPV_RENDER_PARAM_SW_FORMAT, "rgba"},
           {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
           {MPV_RENDER_PARAM_SW_POINTER, pixel_buffer_.get()},
           {MPV_RENDER_PARAM_INVALID, nullptr},
