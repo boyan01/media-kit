@@ -282,7 +282,8 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                     gint64 height = video_output_get_height(self);
                     if (width > 0 && height > 0) {
                       gint32 size[]{(gint32)width, (gint32)height};
-                      gint32 pitch = 4 * (gint32)width;
+                      // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
+                      size_t pitch = 4 * (size_t)width;
                       mpv_render_param params[]{
                           {MPV_RENDER_PARAM_SW_SIZE, size},
                           {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
