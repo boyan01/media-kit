@@ -23,7 +23,7 @@ struct _VideoOutput {
   EGLSurface egl_surface; /* Place holder surface for activating egl context */
   guint8* pixel_buffer;
   TextureSW* texture_sw;
-  GMutex mutex; /* Only used in S/W rendering. */
+  GMutex mutex; /* Guards S/W rendering against dispose. */
   mpv_handle* handle;
   mpv_render_context* render_context;
   gint64 width;
@@ -83,12 +83,16 @@ static void video_output_dispose(GObject* object) {
   if (self->texture_sw) {
     fl_texture_registrar_unregister_texture(self->texture_registrar,
                                             FL_TEXTURE(self->texture_sw));
-    g_free(self->pixel_buffer);
-    g_object_unref(self->texture_sw);
+    // Wait for an in-flight |video_output_render_sw| on the raster thread.
+    g_mutex_lock(&self->mutex);
     if (self->render_context != NULL) {
       mpv_render_context_free(self->render_context);
       self->render_context = NULL;
     }
+    g_free(self->pixel_buffer);
+    self->pixel_buffer = NULL;
+    g_mutex_unlock(&self->mutex);
+    g_object_unref(self->texture_sw);
   }
   
   g_mutex_clear(&self->mutex);
@@ -271,35 +275,13 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
         mpv_render_context_set_update_callback(
             self->render_context,
             [](void* data) {
-              gdk_threads_add_idle(
-                  [](gpointer data) -> gboolean {
-                    VideoOutput* self = (VideoOutput*)data;
-                    if (self->destroyed) {
-                      return FALSE;
-                    }
-                    g_mutex_lock(&self->mutex);
-                    gint64 width = 0, height = 0;
-                    video_output_get_size(self, &width, &height);
-                    if (width > 0 && height > 0) {
-                      gint32 size[]{(gint32)width, (gint32)height};
-                      // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
-                      size_t pitch = 4 * (size_t)width;
-                      mpv_render_param params[]{
-                          {MPV_RENDER_PARAM_SW_SIZE, size},
-                          {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
-                          {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
-                          {MPV_RENDER_PARAM_SW_POINTER, self->pixel_buffer},
-                          {MPV_RENDER_PARAM_INVALID, (void*)0},
-                      };
-                      mpv_render_context_render(self->render_context, params);
-                      fl_texture_registrar_mark_texture_frame_available(
-                          self->texture_registrar,
-                          FL_TEXTURE(self->texture_sw));
-                    }
-                    g_mutex_unlock(&self->mutex);
-                    return FALSE;
-                  },
-                  data);
+              VideoOutput* self = (VideoOutput*)data;
+              if (self->destroyed) {
+                return;
+              }
+              // The frame is rendered in |texture_sw_copy_pixels|.
+              fl_texture_registrar_mark_texture_frame_available(
+                  self->texture_registrar, FL_TEXTURE(self->texture_sw));
             },
             self);
       }
@@ -357,8 +339,31 @@ EGLSurface video_output_get_egl_surface(VideoOutput* self) {
   return self->egl_surface;
 }
 
-guint8* video_output_get_pixel_buffer(VideoOutput* self) {
-  return self->pixel_buffer;
+const guint8* video_output_render_sw(VideoOutput* self,
+                                     gint64 width,
+                                     gint64 height) {
+  const guint8* pixel_buffer = NULL;
+  g_mutex_lock(&self->mutex);
+  if (!self->destroyed && self->render_context != NULL &&
+      self->pixel_buffer != NULL) {
+    gint32 size[]{(gint32)width, (gint32)height};
+    // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
+    size_t pitch = 4 * (size_t)width;
+    int block_for_target_time = 0;
+    mpv_render_param params[]{
+        {MPV_RENDER_PARAM_SW_SIZE, size},
+        {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
+        {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
+        {MPV_RENDER_PARAM_SW_POINTER, self->pixel_buffer},
+        {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
+        {MPV_RENDER_PARAM_INVALID, (void*)0},
+    };
+    if (mpv_render_context_render(self->render_context, params) == 0) {
+      pixel_buffer = self->pixel_buffer;
+    }
+  }
+  g_mutex_unlock(&self->mutex);
+  return pixel_buffer;
 }
 
 // Scales |width| x |height| down, preserving the aspect ratio, so that it fits

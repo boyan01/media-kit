@@ -98,7 +98,15 @@ EGLContext video_output_get_egl_context(VideoOutput* self);
 
 EGLSurface video_output_get_egl_surface(VideoOutput* self);
 
-guint8* video_output_get_pixel_buffer(VideoOutput* self);
+/**
+ * @brief Renders the current video frame into the S/W pixel buffer at
+ * |width| x |height|. Called from Flutter's raster thread.
+ *
+ * @return The pixel buffer, or NULL if nothing was rendered.
+ */
+const guint8* video_output_render_sw(VideoOutput* self,
+                                     gint64 width,
+                                     gint64 height);
 
 /**
  * @brief Returns the current texture size. Both dimensions are read together

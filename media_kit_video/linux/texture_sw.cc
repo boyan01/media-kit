@@ -48,17 +48,22 @@ gboolean texture_sw_copy_pixels(FlPixelBufferTexture* texture,
   gint64 required_width = 0, required_height = 0;
   video_output_get_size(video_output, &required_width, &required_height);
   if (required_width > 0 && required_height > 0) {
-    guint8* pixel_buffer = video_output_get_pixel_buffer(video_output);
-    if (self->current_width != required_width ||
-        self->current_height != required_height) {
-      self->current_width = required_width;
-      self->current_height = required_height;
-      // Notify Flutter about the change in texture's dimensions.
-      video_output_notify_texture_update(video_output);
+    // Render on this (raster) thread, so the buffer is not written while
+    // Flutter uploads it & always matches the returned dimensions.
+    const guint8* pixel_buffer =
+        video_output_render_sw(video_output, required_width, required_height);
+    if (pixel_buffer != NULL) {
+      if (self->current_width != required_width ||
+          self->current_height != required_height) {
+        self->current_width = required_width;
+        self->current_height = required_height;
+        // Notify Flutter about the change in texture's dimensions.
+        video_output_notify_texture_update(video_output);
+      }
+      *buffer = pixel_buffer;
+      *width = self->current_width;
+      *height = self->current_height;
     }
-    *buffer = pixel_buffer;
-    *width = required_width;
-    *height = required_height;
   }
   return TRUE;
 }
