@@ -44,7 +44,8 @@ struct _TextureGL {
   // platform thread, which has no current context with Impeller.
   EGLContext flutter_share_context;
   guint32 fbo;               // mpv's FBO
-  guint32 mpv_texture;       // mpv's texture
+  guint32 mpv_texture;       // mpv's texture, attached to |fbo|
+  guint32 export_texture;    // Copy of |mpv_texture| that |egl_image| refers to
   EGLImageKHR egl_image;     // EGLImage for sharing between contexts
   gboolean wait_sync_supported;  // EGL_KHR_fence_sync & EGL_KHR_wait_sync
   guint32 current_width;
@@ -59,6 +60,7 @@ static void texture_gl_init(TextureGL* self) {
   self->flutter_share_context = EGL_NO_CONTEXT;
   self->fbo = 0;
   self->mpv_texture = 0;
+  self->export_texture = 0;
   self->egl_image = EGL_NO_IMAGE_KHR;
   self->wait_sync_supported = FALSE;
   self->current_width = 1;
@@ -116,6 +118,10 @@ static void texture_gl_dispose(GObject* object) {
       if (self->mpv_texture != 0) {
         glDeleteTextures(1, &self->mpv_texture);
         self->mpv_texture = 0;
+      }
+      if (self->export_texture != 0) {
+        glDeleteTextures(1, &self->export_texture);
+        self->export_texture = 0;
       }
       if (self->fbo != 0) {
         glDeleteFramebuffers(1, &self->fbo);
@@ -186,7 +192,8 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
   gint32 required_height = (gint32)video_height;
   
   if (required_width > 0 && required_height > 0) {
-    gboolean first_frame = self->name == 0 || self->fbo == 0 || self->mpv_texture == 0;
+    gboolean first_frame = self->name == 0 || self->fbo == 0 ||
+                           self->mpv_texture == 0 || self->export_texture == 0;
     gboolean resize = self->current_width != required_width ||
                       self->current_height != required_height;
     
@@ -206,6 +213,7 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
       // Free previous resources in mpv's context
       if (!first_frame) {
         glDeleteTextures(1, &self->mpv_texture);
+        glDeleteTextures(1, &self->export_texture);
         glDeleteFramebuffers(1, &self->fbo);
         if (self->egl_image != EGL_NO_IMAGE_KHR) {
           eglDestroyImageKHR(egl_display, self->egl_image);
@@ -228,14 +236,27 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
       // Attach mpv's texture to FBO
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                              GL_TEXTURE_2D, self->mpv_texture, 0);
-      
-      // Create EGLImage from mpv's texture
+
+      // Share a copy of mpv's texture rather than mpv's texture itself: on
+      // some drivers (e.g. Mesa on Intel Xe2), a texture referred to by an
+      // EGLImage no longer receives mpv's rendering, leaving the video black.
+      // See https://github.com/media-kit/media-kit/issues/1463.
+      glGenTextures(1, &self->export_texture);
+      glBindTexture(GL_TEXTURE_2D, self->export_texture);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, required_width, required_height,
+                   0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+      // Create EGLImage from the copy of mpv's texture
       EGLint egl_image_attribs[] = { EGL_NONE };
       self->egl_image = eglCreateImageKHR(
           egl_display,
           egl_context,
           EGL_GL_TEXTURE_2D_KHR,
-          (EGLClientBuffer)(guintptr)self->mpv_texture,
+          (EGLClientBuffer)(guintptr)self->export_texture,
           egl_image_attribs);
       if (self->egl_image == EGL_NO_IMAGE_KHR) {
         g_printerr("media_kit: TextureGL: Failed to create EGLImage. Error: 0x%x\n", eglGetError());
@@ -303,7 +324,14 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
         {MPV_RENDER_PARAM_INVALID, NULL},
     };
     mpv_render_context_render(render_context, params);
-    
+
+    // Copy the frame into the texture that Flutter samples through |egl_image|
+    glBindFramebuffer(GL_FRAMEBUFFER, self->fbo);
+    glBindTexture(GL_TEXTURE_2D, self->export_texture);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, required_width,
+                        required_height);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     // Unbind FBO
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     
