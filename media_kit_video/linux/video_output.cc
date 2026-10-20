@@ -23,10 +23,13 @@ struct _VideoOutput {
   EGLContext egl_context; /* Isolated EGL context (non-shared). */
   EGLSurface egl_surface; /* Place holder surface for activating egl context */
   guint8* pixel_buffer;
+  guint8* rotate_buffer; /* S/W only: unrotated frame, see |applied_rotate|. */
   TextureSW* texture_sw;
   GMutex mutex; /* Guards S/W rendering against dispose. */
   mpv_handle* handle;
   mpv_render_context* render_context;
+  mpv_handle* rotate_client; /* S/W only: issues the rotation vf commands. */
+  gint64 applied_rotate;     /* S/W only: rotation applied on the CPU. */
   gint64 width;
   gint64 height;
   VideoOutputConfiguration configuration;
@@ -37,6 +40,8 @@ struct _VideoOutput {
 };
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
+
+#define SW_ROTATE_FILTER_LABEL "@media_kit_rotate"
 
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
@@ -92,6 +97,16 @@ static void video_output_dispose(GObject* object) {
     }
     g_free(self->pixel_buffer);
     self->pixel_buffer = NULL;
+    g_free(self->rotate_buffer);
+    self->rotate_buffer = NULL;
+    if (self->rotate_client != NULL) {
+      if (self->applied_rotate != 0) {
+        const char* command[] = {"vf", "remove", SW_ROTATE_FILTER_LABEL, NULL};
+        mpv_command_async(self->rotate_client, 0, command);
+      }
+      mpv_destroy(self->rotate_client);
+      self->rotate_client = NULL;
+    }
     g_mutex_unlock(&self->mutex);
     g_object_unref(self->texture_sw);
   }
@@ -111,8 +126,11 @@ static void video_output_init(VideoOutput* self) {
   self->egl_surface = EGL_NO_SURFACE;
   self->texture_sw = NULL;
   self->pixel_buffer = NULL;
+  self->rotate_buffer = NULL;
   self->handle = NULL;
   self->render_context = NULL;
+  self->rotate_client = NULL;
+  self->applied_rotate = 0;
   self->width = 0;
   self->height = 0;
   self->configuration = VideoOutputConfiguration{};
@@ -365,6 +383,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                   self->texture_registrar, FL_TEXTURE(self->texture_sw));
             },
             self);
+        // A separate client, so that the async command replies do not reach
+        // package:media_kit's event loop.
+        self->rotate_client =
+            mpv_create_client(self->handle, "media_kit_video_sw_rotate");
       }
     }
   }
@@ -420,16 +442,103 @@ EGLSurface video_output_get_egl_surface(VideoOutput* self) {
   return self->egl_surface;
 }
 
+// libmpv's S/W renderer cannot rotate frames: libmpv <= 0.41 aborts on an
+// assertion for 90/270 degree rotation & later versions present the frame
+// unrotated. Strip the rotation with mpv's format filter instead & rotate the
+// rendered frame on the CPU (FFmpeg's filters e.g. transpose are not available
+// in every libmpv build). Called with |mutex| held.
+static void video_output_update_sw_rotation(VideoOutput* self) {
+  mpv_event* event;
+  while ((event = mpv_wait_event(self->rotate_client, 0))->event_id !=
+         MPV_EVENT_NONE) {
+    if (event->event_id == MPV_EVENT_SHUTDOWN) {
+      mpv_destroy(self->rotate_client);
+      self->rotate_client = NULL;
+      return;
+    }
+    if (event->event_id == MPV_EVENT_COMMAND_REPLY && event->error < 0) {
+      g_printerr("media_kit: VideoOutput: Failed to rotate S/W frames: %s\n",
+                 mpv_error_string(event->error));
+    }
+  }
+
+  // Rotation of the decoded video, i.e. before the video filters.
+  gint64 rotate = 0;
+  mpv_get_property(self->handle, "video-params/rotate", MPV_FORMAT_INT64,
+                   &rotate);
+  rotate = ((rotate % 360) + 360) % 360;
+  if (rotate % 90 != 0 || rotate == self->applied_rotate) {
+    return;
+  }
+  if (self->applied_rotate == 0) {
+    const char* command[] = {
+        "vf", "add", SW_ROTATE_FILTER_LABEL ":format=rotate=0", NULL};
+    mpv_command_async(self->rotate_client, 0, command);
+  } else if (rotate == 0) {
+    const char* command[] = {"vf", "remove", SW_ROTATE_FILTER_LABEL, NULL};
+    mpv_command_async(self->rotate_client, 0, command);
+  }
+  self->applied_rotate = rotate;
+}
+
+// Rotates the |width| x |height| image |src| clockwise by |rotate| (90, 180 or
+// 270) degrees into |dst|.
+static void video_output_rotate_pixels(const guint32* src,
+                                       gint64 width,
+                                       gint64 height,
+                                       gint64 rotate,
+                                       guint32* dst) {
+  // |dst| index of the pixel at (x, y) is |origin| + x * |dx| + y * |dy|.
+  gint64 origin = height - 1, dx = height, dy = -1;
+  if (rotate == 180) {
+    origin = width * height - 1, dx = -1, dy = -width;
+  } else if (rotate == 270) {
+    origin = (width - 1) * height, dx = -height, dy = 1;
+  }
+  // Walk in tiles, so that both the reads & the writes stay cache friendly.
+  const gint64 tile = 64;
+  for (gint64 ty = 0; ty < height; ty += tile) {
+    for (gint64 tx = 0; tx < width; tx += tile) {
+      for (gint64 y = ty; y < MIN(ty + tile, height); y++) {
+        for (gint64 x = tx; x < MIN(tx + tile, width); x++) {
+          dst[origin + x * dx + y * dy] = src[y * width + x];
+        }
+      }
+    }
+  }
+}
+
 const guint8* video_output_render_sw(VideoOutput* self,
                                      gint64 width,
                                      gint64 height) {
   const guint8* pixel_buffer = NULL;
   g_mutex_lock(&self->mutex);
+  if (self->rotate_client != NULL) {
+    video_output_update_sw_rotation(self);
+  }
+  // Frames that still carry the rotation must not reach the renderer (see
+  // |video_output_update_sw_rotation|).
+  gint64 rotate = 0;
+  mpv_get_property(self->handle, "video-out-params/rotate", MPV_FORMAT_INT64,
+                   &rotate);
   if (!self->destroyed && self->render_context != NULL &&
-      self->pixel_buffer != NULL) {
-    gint32 size[]{(gint32)width, (gint32)height};
+      self->pixel_buffer != NULL && rotate == 0) {
+    // Render the unrotated frame, then rotate it into |pixel_buffer|.
+    gint64 render_width = width, render_height = height;
+    guint8* target = self->pixel_buffer;
+    if (self->applied_rotate != 0) {
+      if (self->applied_rotate != 180) {
+        render_width = height;
+        render_height = width;
+      }
+      if (self->rotate_buffer == NULL) {
+        self->rotate_buffer = g_new0(guint8, SW_RENDERING_PIXEL_BUFFER_SIZE);
+      }
+      target = self->rotate_buffer;
+    }
+    gint32 size[]{(gint32)render_width, (gint32)render_height};
     // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
-    size_t pitch = 4 * (size_t)width;
+    size_t pitch = 4 * (size_t)render_width;
     int block_for_target_time = 0;
     mpv_render_param params[]{
         {MPV_RENDER_PARAM_SW_SIZE, size},
@@ -438,11 +547,16 @@ const guint8* video_output_render_sw(VideoOutput* self,
         // widgets behind the texture.
         {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgba"},
         {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
-        {MPV_RENDER_PARAM_SW_POINTER, self->pixel_buffer},
+        {MPV_RENDER_PARAM_SW_POINTER, target},
         {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
         {MPV_RENDER_PARAM_INVALID, (void*)0},
     };
     if (mpv_render_context_render(self->render_context, params) == 0) {
+      if (target != self->pixel_buffer) {
+        video_output_rotate_pixels((const guint32*)target, render_width,
+                                   render_height, self->applied_rotate,
+                                   (guint32*)self->pixel_buffer);
+      }
       pixel_buffer = self->pixel_buffer;
     }
   }
@@ -494,6 +608,11 @@ static void video_output_get_video_size(VideoOutput* self,
       }
     }
     mpv_free_node_contents(&params);
+  }
+  if (rotate == 0 && self->texture_sw != NULL) {
+    // The rotation is stripped by vf & applied on the CPU in S/W rendering.
+    mpv_get_property(self->handle, "video-params/rotate", MPV_FORMAT_INT64,
+                     &rotate);
   }
 
   *width = rotate == 0 || rotate == 180 ? dw : dh;
