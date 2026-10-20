@@ -40,6 +40,9 @@ static void init_egl_image_extensions() {
 struct _TextureGL {
   FlTextureGL parent_instance;
   guint32 name;              // Flutter's texture name
+  // Shares Flutter's texture names, so that |name| can be deleted from the
+  // platform thread, which has no current context with Impeller.
+  EGLContext flutter_share_context;
   guint32 fbo;               // mpv's FBO
   guint32 mpv_texture;       // mpv's texture
   EGLImageKHR egl_image;     // EGLImage for sharing between contexts
@@ -53,6 +56,7 @@ G_DEFINE_TYPE(TextureGL, texture_gl, fl_texture_gl_get_type())
 
 static void texture_gl_init(TextureGL* self) {
   self->name = 0;
+  self->flutter_share_context = EGL_NO_CONTEXT;
   self->fbo = 0;
   self->mpv_texture = 0;
   self->egl_image = EGL_NO_IMAGE_KHR;
@@ -72,11 +76,27 @@ static void texture_gl_dispose(GObject* object) {
   EGLSurface current_draw = eglGetCurrentSurface(EGL_DRAW);
   EGLSurface current_read = eglGetCurrentSurface(EGL_READ);
   
-  // Clean up Flutter's texture (in Flutter's context)
-  if (self->name != 0) {
+  // Clean up Flutter's texture (in Flutter's share group)
+  if (self->flutter_share_context != EGL_NO_CONTEXT && video_output != NULL) {
+    EGLDisplay egl_display = video_output_get_egl_display(video_output);
+    if (self->name != 0 &&
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       self->flutter_share_context)) {
+      glDeleteTextures(1, &self->name);
+      if (current_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(current_display, current_draw, current_read,
+                       current_context);
+      } else {
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
+      }
+    }
+    eglDestroyContext(egl_display, self->flutter_share_context);
+    self->flutter_share_context = EGL_NO_CONTEXT;
+  } else if (self->name != 0 && eglGetCurrentContext() != EGL_NO_CONTEXT) {
     glDeleteTextures(1, &self->name);
-    self->name = 0;
   }
+  self->name = 0;
   
   // Clean up EGLImage
   if (self->egl_image != EGL_NO_IMAGE_KHR && video_output != NULL) {
@@ -103,7 +123,11 @@ static void texture_gl_dispose(GObject* object) {
       }
       
       // Restore previous context
-      eglMakeCurrent(current_display, current_draw, current_read, current_context);
+      if (current_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(current_display, current_draw, current_read, current_context);
+      } else {
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+      }
     }
   }
   
@@ -137,7 +161,25 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
                                      GError** error) {
   TextureGL* self = TEXTURE_GL(texture);
   VideoOutput* video_output = self->video_output;
-  
+
+  if (self->name == 0 && self->flutter_share_context == EGL_NO_CONTEXT) {
+    // Flutter's context is current on the raster thread.
+    EGLDisplay flutter_display = eglGetCurrentDisplay();
+    EGLContext flutter_context = eglGetCurrentContext();
+    EGLint config_id = 0, num_configs = 0;
+    EGLConfig config = NULL;
+    eglQueryContext(flutter_display, flutter_context, EGL_CONFIG_ID, &config_id);
+    EGLint config_attribs[] = {EGL_CONFIG_ID, config_id, EGL_NONE};
+    if (eglChooseConfig(flutter_display, config_attribs, &config, 1, &num_configs) && num_configs > 0) {
+      EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+      self->flutter_share_context = eglCreateContext(
+          flutter_display, config, flutter_context, context_attribs);
+    }
+    if (self->flutter_share_context == EGL_NO_CONTEXT) {
+      g_printerr("media_kit: TextureGL: Failed to create Flutter's share context. Error: 0x%x\n", eglGetError());
+    }
+  }
+
   gint64 video_width = 0, video_height = 0;
   video_output_get_size(video_output, &video_width, &video_height);
   gint32 required_width = (gint32)video_width;
