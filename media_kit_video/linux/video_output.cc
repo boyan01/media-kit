@@ -11,6 +11,7 @@
 #include "include/media_kit_video/texture_sw.h"
 
 #include <epoxy/egl.h>
+#include <epoxy/gl.h>
 #include <epoxy/glx.h>
 #include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
@@ -122,6 +123,67 @@ static void video_output_init(VideoOutput* self) {
   g_mutex_init(&self->mutex);
 }
 
+// Checks that a texture of mpv's isolated context can be shared with Flutter's
+// context through an EGLImage, which is how |TextureGL| presents frames. Must
+// be called with mpv's context current; it is current again on return.
+static gboolean video_output_check_egl_image_support(
+    EGLDisplay display,
+    EGLContext context,
+    EGLSurface flutter_draw_surface,
+    EGLSurface flutter_read_surface,
+    EGLContext flutter_context) {
+  if (!epoxy_has_egl_extension(display, "EGL_KHR_image_base") ||
+      !epoxy_has_egl_extension(display, "EGL_KHR_gl_texture_2D_image")) {
+    g_printerr("media_kit: VideoOutput: EGL_KHR_gl_texture_2D_image is not supported.\n");
+    return FALSE;
+  }
+
+  GLuint texture = 0;
+  glGenTextures(1, &texture);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+               NULL);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  EGLint attribs[] = {EGL_NONE};
+  EGLImageKHR image =
+      eglCreateImageKHR(display, context, EGL_GL_TEXTURE_2D_KHR,
+                        (EGLClientBuffer)(guintptr)texture, attribs);
+  if (image == EGL_NO_IMAGE_KHR) {
+    g_printerr("media_kit: VideoOutput: Failed to create EGLImage. Error: 0x%x\n", eglGetError());
+    glDeleteTextures(1, &texture);
+    return FALSE;
+  }
+
+  gboolean supported = FALSE;
+  eglMakeCurrent(display, flutter_draw_surface, flutter_read_surface,
+                 flutter_context);
+  if (epoxy_has_gl_extension("GL_OES_EGL_image")) {
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    GLuint flutter_texture = 0;
+    glGenTextures(1, &flutter_texture);
+    glBindTexture(GL_TEXTURE_2D, flutter_texture);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    GLenum error = glGetError();
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteTextures(1, &flutter_texture);
+    if (error == GL_NO_ERROR) {
+      supported = TRUE;
+    } else {
+      g_printerr("media_kit: VideoOutput: Failed to import EGLImage. Error: 0x%x\n", error);
+    }
+  } else {
+    g_printerr("media_kit: VideoOutput: GL_OES_EGL_image is not supported.\n");
+  }
+  eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
+
+  eglDestroyImageKHR(display, image);
+  glDeleteTextures(1, &texture);
+  return supported;
+}
+
 VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                               FlView* view,
                               gint64 handle,
@@ -143,6 +205,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   // Causes frame drops with `pulse` audio output. (SlotSun/dart_simple_live#42)
   // mpv_set_option_string(self->handle, "video-timing-offset", "0");
   gboolean hardware_acceleration_supported = FALSE;
+  gboolean texture_gl_registered = FALSE;
   if (self->configuration.enable_hardware_acceleration) {
     // Get Flutter's current EGL display (DO NOT share context)
     EGLDisplay flutter_display = eglGetCurrentDisplay();
@@ -194,8 +257,14 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
             // Create texture with our isolated context
             self->texture_gl = texture_gl_new(self);
             
-            if (fl_texture_registrar_register_texture(
+            if (!video_output_check_egl_image_support(
+                    self->egl_display, self->egl_context,
+                    flutter_draw_surface, flutter_read_surface,
+                    flutter_context)) {
+              // Fall back to S/W rendering below.
+            } else if (fl_texture_registrar_register_texture(
                     texture_registrar, FL_TEXTURE(self->texture_gl))) {
+              texture_gl_registered = TRUE;
               // Initialize mpv with our isolated EGL context
               mpv_opengl_init_params gl_init_params{
                   [](auto, auto name) {
@@ -259,10 +328,22 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   }
 #ifdef MPV_RENDER_API_TYPE_SW
   if (!hardware_acceleration_supported) {
+    // Release the partially initialized H/W rendering resources.
+    if (self->texture_gl != NULL) {
+      if (texture_gl_registered) {
+        fl_texture_registrar_unregister_texture(texture_registrar,
+                                                FL_TEXTURE(self->texture_gl));
+      }
+      g_object_unref(self->texture_gl);
+      self->texture_gl = NULL;
+    }
+    if (self->egl_context != EGL_NO_CONTEXT) {
+      eglDestroyContext(self->egl_display, self->egl_context);
+      self->egl_context = EGL_NO_CONTEXT;
+    }
     g_printerr("media_kit: VideoOutput: S/W rendering.\n");
     // H/W rendering failed. Fallback to S/W rendering.
     self->pixel_buffer = g_new0(guint8, SW_RENDERING_PIXEL_BUFFER_SIZE);
-    self->texture_gl = NULL;
     self->texture_sw = texture_sw_new(self);
     if (fl_texture_registrar_register_texture(texture_registrar,
                                               FL_TEXTURE(self->texture_sw))) {
