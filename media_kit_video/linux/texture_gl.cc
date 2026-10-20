@@ -43,6 +43,7 @@ struct _TextureGL {
   guint32 fbo;               // mpv's FBO
   guint32 mpv_texture;       // mpv's texture
   EGLImageKHR egl_image;     // EGLImage for sharing between contexts
+  gboolean wait_sync_supported;  // EGL_KHR_fence_sync & EGL_KHR_wait_sync
   guint32 current_width;
   guint32 current_height;
   VideoOutput* video_output;
@@ -55,6 +56,7 @@ static void texture_gl_init(TextureGL* self) {
   self->fbo = 0;
   self->mpv_texture = 0;
   self->egl_image = EGL_NO_IMAGE_KHR;
+  self->wait_sync_supported = FALSE;
   self->current_width = 1;
   self->current_height = 1;
   self->video_output = NULL;
@@ -120,6 +122,10 @@ TextureGL* texture_gl_new(VideoOutput* video_output) {
   init_egl_image_extensions();
   TextureGL* self = TEXTURE_GL(g_object_new(texture_gl_get_type(), NULL));
   self->video_output = video_output;
+  EGLDisplay egl_display = video_output_get_egl_display(video_output);
+  self->wait_sync_supported =
+      epoxy_has_egl_extension(egl_display, "EGL_KHR_fence_sync") &&
+      epoxy_has_egl_extension(egl_display, "EGL_KHR_wait_sync");
   return self;
 }
 
@@ -189,6 +195,9 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
           EGL_GL_TEXTURE_2D_KHR,
           (EGLClientBuffer)(guintptr)self->mpv_texture,
           egl_image_attribs);
+      if (self->egl_image == EGL_NO_IMAGE_KHR) {
+        g_printerr("media_kit: TextureGL: Failed to create EGLImage. Error: 0x%x\n", eglGetError());
+      }
       
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glBindTexture(GL_TEXTURE_2D, 0);
@@ -211,7 +220,9 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self->egl_image);
+      if (self->egl_image != EGL_NO_IMAGE_KHR) {
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, self->egl_image);
+      }
       glBindTexture(GL_TEXTURE_2D, 0);
       
       self->current_width = required_width;
@@ -254,11 +265,26 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
     // Unbind FBO
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     
-    // Flush to ensure rendering is complete
-    glFlush();
+    // The contexts are not shared, so glFlush alone does not guarantee that
+    // mpv's rendering has finished when Flutter samples the EGLImage. Make
+    // Flutter's context wait on a fence, or block with glFinish otherwise.
+    EGLSyncKHR sync = EGL_NO_SYNC_KHR;
+    if (self->wait_sync_supported) {
+      sync = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+    }
+    if (sync != EGL_NO_SYNC_KHR) {
+      glFlush();
+    } else {
+      glFinish();
+    }
     
     // Restore Flutter's context
     eglMakeCurrent(flutter_display, flutter_draw, flutter_read, flutter_context);
+    
+    if (sync != EGL_NO_SYNC_KHR) {
+      eglWaitSyncKHR(egl_display, sync, 0);
+      eglDestroySyncKHR(egl_display, sync);
+    }
   }
   
   *target = GL_TEXTURE_2D;
