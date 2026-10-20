@@ -83,6 +83,8 @@ class VideoOutput {
 
   void CheckAndResize();
 
+  void UpdateSoftwareRotation();
+
   void Resize(int64_t required_width, int64_t required_height);
 
   // Reads width & height together, so that both belong to the same
@@ -118,6 +120,12 @@ class VideoOutput {
   // S/W rendering.
 
   std::unique_ptr<uint8_t[]> pixel_buffer_ = nullptr;
+  // Unrotated frame; see |UpdateSoftwareRotation|.
+  std::unique_ptr<uint8_t[]> rotate_buffer_ = nullptr;
+  // Issues the rotation vf commands; see |UpdateSoftwareRotation|.
+  mpv_handle* rotate_client_ = nullptr;
+  // Rotation applied on the CPU.
+  int64_t applied_rotate_ = 0;
   std::unordered_map<int64_t, std::unique_ptr<FlutterDesktopPixelBuffer>>
       pixel_buffer_textures_ = {};
 

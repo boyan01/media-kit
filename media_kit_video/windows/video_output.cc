@@ -17,6 +17,35 @@
 #define SW_RENDERING_PIXEL_BUFFER_SIZE \
   (SW_RENDERING_MAX_WIDTH) * (SW_RENDERING_MAX_HEIGHT) * (4)
 
+#define SW_ROTATE_FILTER_LABEL "@media_kit_rotate"
+
+// Rotates the |width| x |height| image |src| clockwise by |rotate| (90, 180 or
+// 270) degrees into |dst|.
+static void RotatePixels(const uint32_t* src,
+                         int64_t width,
+                         int64_t height,
+                         int64_t rotate,
+                         uint32_t* dst) {
+  // |dst| index of the pixel at (x, y) is |origin| + x * |dx| + y * |dy|.
+  int64_t origin = height - 1, dx = height, dy = -1;
+  if (rotate == 180) {
+    origin = width * height - 1, dx = -1, dy = -width;
+  } else if (rotate == 270) {
+    origin = (width - 1) * height, dx = -height, dy = 1;
+  }
+  // Walk in tiles, so that both the reads & the writes stay cache friendly.
+  const int64_t tile = 64;
+  for (int64_t ty = 0; ty < height; ty += tile) {
+    for (int64_t tx = 0; tx < width; tx += tile) {
+      for (int64_t y = ty; y < (std::min)(ty + tile, height); y++) {
+        for (int64_t x = tx; x < (std::min)(tx + tile, width); x++) {
+          dst[origin + x * dx + y * dy] = src[y * width + x];
+        }
+      }
+    }
+  }
+}
+
 // Scales |width| x |height| down, preserving the aspect ratio, so that it fits
 // in the S/W rendering pixel buffer. Portrait sizes use the transposed bounds.
 static void FitSoftwareSize(int64_t& width, int64_t& height) {
@@ -124,6 +153,10 @@ VideoOutput::VideoOutput(int64_t handle,
               that->NotifyRender();
             },
             reinterpret_cast<void*>(this));
+        // A separate client, so that the async command replies do not reach
+        // package:media_kit's event loop.
+        rotate_client_ =
+            mpv_create_client(handle_, "media_kit_video_sw_rotate");
       }
     }
   });
@@ -169,8 +202,18 @@ VideoOutput::~VideoOutput() {
   promise.get_future().wait();
   texture_id_ = 0;
 
-  thread_pool_ref_->Post([render_context = render_context_]() {
+  thread_pool_ref_->Post([render_context = render_context_,
+                           rotate_client = rotate_client_,
+                           applied_rotate = applied_rotate_]() {
     mpv_render_context_free(render_context);
+    if (rotate_client != nullptr) {
+      if (applied_rotate != 0) {
+        const char* command[] = {"vf", "remove", SW_ROTATE_FILTER_LABEL,
+                                 nullptr};
+        mpv_command_async(rotate_client, 0, command);
+      }
+      mpv_destroy(rotate_client);
+    }
   });
 }
 
@@ -202,10 +245,32 @@ void VideoOutput::Render() {
     }
     // S/W
     if (pixel_buffer_ != nullptr) {
-      int32_t size[]{
-          static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->width),
-          static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->height),
-      };
+      if (rotate_client_ != nullptr) {
+        UpdateSoftwareRotation();
+      }
+      // Frames that still carry the rotation must not reach the renderer (see
+      // |UpdateSoftwareRotation|).
+      int64_t rotate = 0;
+      mpv_get_property(handle_, "video-out-params/rotate", MPV_FORMAT_INT64,
+                       &rotate);
+      if (rotate != 0) {
+        return;
+      }
+      // Render the unrotated frame, then rotate it into |pixel_buffer_|.
+      int64_t width = pixel_buffer_textures_.at(texture_id_)->width;
+      int64_t height = pixel_buffer_textures_.at(texture_id_)->height;
+      auto target = pixel_buffer_.get();
+      if (applied_rotate_ != 0) {
+        if (applied_rotate_ != 180) {
+          std::swap(width, height);
+        }
+        if (rotate_buffer_ == nullptr) {
+          rotate_buffer_ =
+              std::make_unique<uint8_t[]>(SW_RENDERING_PIXEL_BUFFER_SIZE);
+        }
+        target = rotate_buffer_.get();
+      }
+      int32_t size[]{static_cast<int32_t>(width), static_cast<int32_t>(height)};
       // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
       size_t pitch = 4 * static_cast<size_t>(size[0]);
       mpv_render_param params[]{
@@ -215,10 +280,15 @@ void VideoOutput::Render() {
           // widgets behind the texture.
           {MPV_RENDER_PARAM_SW_FORMAT, "rgba"},
           {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
-          {MPV_RENDER_PARAM_SW_POINTER, pixel_buffer_.get()},
+          {MPV_RENDER_PARAM_SW_POINTER, target},
           {MPV_RENDER_PARAM_INVALID, nullptr},
       };
-      mpv_render_context_render(render_context_, params);
+      if (mpv_render_context_render(render_context_, params) == 0 &&
+          target != pixel_buffer_.get()) {
+        RotatePixels(reinterpret_cast<const uint32_t*>(target), width, height,
+                     applied_rotate_,
+                     reinterpret_cast<uint32_t*>(pixel_buffer_.get()));
+      }
     }
     try {
       // Notify Flutter that a new frame is available.
@@ -227,6 +297,44 @@ void VideoOutput::Render() {
       // Prevent any redundant exceptions if the texture is unregistered etc.
     }
   }
+}
+
+// libmpv's S/W renderer cannot rotate frames: libmpv <= 0.41 aborts on an
+// assertion for 90/270 degree rotation & later versions present the frame
+// unrotated. Strip the rotation with mpv's format filter instead & rotate the
+// rendered frame on the CPU (FFmpeg's filters e.g. transpose are not available
+// in every libmpv build). Called on the thread pool.
+void VideoOutput::UpdateSoftwareRotation() {
+  mpv_event* event;
+  while ((event = mpv_wait_event(rotate_client_, 0))->event_id !=
+         MPV_EVENT_NONE) {
+    if (event->event_id == MPV_EVENT_SHUTDOWN) {
+      mpv_destroy(rotate_client_);
+      rotate_client_ = nullptr;
+      return;
+    }
+    if (event->event_id == MPV_EVENT_COMMAND_REPLY && event->error < 0) {
+      std::cout << "media_kit: VideoOutput: Failed to rotate S/W frames: "
+                << mpv_error_string(event->error) << std::endl;
+    }
+  }
+
+  // Rotation of the decoded video, i.e. before the video filters.
+  int64_t rotate = 0;
+  mpv_get_property(handle_, "video-params/rotate", MPV_FORMAT_INT64, &rotate);
+  rotate = ((rotate % 360) + 360) % 360;
+  if (rotate % 90 != 0 || rotate == applied_rotate_) {
+    return;
+  }
+  if (applied_rotate_ == 0) {
+    const char* command[] = {"vf", "add",
+                             SW_ROTATE_FILTER_LABEL ":format=rotate=0", nullptr};
+    mpv_command_async(rotate_client_, 0, command);
+  } else if (rotate == 0) {
+    const char* command[] = {"vf", "remove", SW_ROTATE_FILTER_LABEL, nullptr};
+    mpv_command_async(rotate_client_, 0, command);
+  }
+  applied_rotate_ = rotate;
 }
 
 void VideoOutput::SetTextureUpdateCallback(
@@ -400,6 +508,11 @@ void VideoOutput::GetVideoSize(int64_t& width, int64_t& height) {
         }
       }
       mpv_free_node_contents(&params);
+    }
+    if (rotate == 0 && pixel_buffer_ != nullptr) {
+      // The rotation is stripped by vf & applied on the CPU in S/W rendering.
+      mpv_get_property(handle_, "video-params/rotate", MPV_FORMAT_INT64,
+                       &rotate);
     }
 
     width = rotate == 0 || rotate == 180 ? dw : dh;
