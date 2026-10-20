@@ -278,8 +278,8 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                       return FALSE;
                     }
                     g_mutex_lock(&self->mutex);
-                    gint64 width = video_output_get_width(self);
-                    gint64 height = video_output_get_height(self);
+                    gint64 width = 0, height = 0;
+                    video_output_get_size(self, &width, &height);
                     if (width > 0 && height > 0) {
                       gint32 size[]{(gint32)width, (gint32)height};
                       // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
@@ -332,21 +332,13 @@ void video_output_set_texture_update_callback(
 }
 
 void video_output_set_size(VideoOutput* self, gint64 width, gint64 height) {
-  // Ideally, a mutex should be used here & |video_output_get_width| +
-  // |video_output_get_height|. However, that is throwing everything into a
-  // deadlock. Flutter itself seems to have some synchronization mechanism in
-  // rendering & platform channels AFAIK.
+  // Ideally, a mutex should be used here & |video_output_get_size|. However,
+  // that is throwing everything into a deadlock. Flutter itself seems to have
+  // some synchronization mechanism in rendering & platform channels AFAIK.
 
-  // H/W
-  if (self->texture_gl) {
-    self->width = width;
-    self->height = height;
-  }
-  // S/W
-  if (self->texture_sw) {
-    self->width = CLAMP(width, 0, SW_RENDERING_MAX_WIDTH);
-    self->height = CLAMP(height, 0, SW_RENDERING_MAX_HEIGHT);
-  }
+  // S/W size is limited in |video_output_get_size|.
+  self->width = width;
+  self->height = height;
 }
 
 mpv_render_context* video_output_get_render_context(VideoOutput* self) {
@@ -369,66 +361,29 @@ guint8* video_output_get_pixel_buffer(VideoOutput* self) {
   return self->pixel_buffer;
 }
 
-gint64 video_output_get_width(VideoOutput* self) {
-  // Fixed width.
-  if (self->width) {
-    return self->width;
+// Scales |width| x |height| down, preserving the aspect ratio, so that it fits
+// in the S/W rendering pixel buffer. Portrait sizes use the transposed bounds.
+static void video_output_fit_sw_size(gint64* width, gint64* height) {
+  if (*width <= 0 || *height <= 0) {
+    return;
   }
-
-  // Video resolution dependent width.
-  gint64 width = 0;
-  gint64 height = 0;
-
-  mpv_node params;
-  mpv_get_property(self->handle, "video-out-params", MPV_FORMAT_NODE, &params);
-
-  int64_t dw = 0, dh = 0, rotate = 0;
-  if (params.format == MPV_FORMAT_NODE_MAP) {
-    for (int32_t i = 0; i < params.u.list->num; i++) {
-      char* key = params.u.list->keys[i];
-      auto value = params.u.list->values[i];
-      if (value.format == MPV_FORMAT_INT64) {
-        if (strcmp(key, "dw") == 0) {
-          dw = value.u.int64;
-        }
-        if (strcmp(key, "dh") == 0) {
-          dh = value.u.int64;
-        }
-        if (strcmp(key, "rotate") == 0) {
-          rotate = value.u.int64;
-        }
-      }
-    }
-    mpv_free_node_contents(&params);
+  gint64 max_width = SW_RENDERING_MAX_WIDTH;
+  gint64 max_height = SW_RENDERING_MAX_HEIGHT;
+  if (*height > *width) {
+    max_width = SW_RENDERING_MAX_HEIGHT;
+    max_height = SW_RENDERING_MAX_WIDTH;
   }
-
-  width = rotate == 0 || rotate == 180 ? dw : dh;
-  height = rotate == 0 || rotate == 180 ? dh : dw;
-
-  if (self->texture_sw != NULL) {
-    // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
-    // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect ratio.
-    if (width >= SW_RENDERING_MAX_WIDTH) {
-      return SW_RENDERING_MAX_WIDTH;
-    }
-    if (height >= SW_RENDERING_MAX_HEIGHT) {
-      return width / height * SW_RENDERING_MAX_HEIGHT;
-    }
+  if (*width <= max_width && *height <= max_height) {
+    return;
   }
-
-  return width;
+  gdouble scale = MIN((gdouble)max_width / *width, (gdouble)max_height / *height);
+  *width = CLAMP((gint64)(*width * scale), 1, max_width);
+  *height = CLAMP((gint64)(*height * scale), 1, max_height);
 }
 
-gint64 video_output_get_height(VideoOutput* self) {
-  // Fixed height.
-  if (self->width) {
-    return self->height;
-  }
-
-  // Video resolution dependent height.
-  gint64 width = 0;
-  gint64 height = 0;
-
+static void video_output_get_video_size(VideoOutput* self,
+                                        gint64* width,
+                                        gint64* height) {
   mpv_node params;
   mpv_get_property(self->handle, "video-out-params", MPV_FORMAT_NODE, &params);
 
@@ -452,21 +407,22 @@ gint64 video_output_get_height(VideoOutput* self) {
     mpv_free_node_contents(&params);
   }
 
-  width = rotate == 0 || rotate == 180 ? dw : dh;
-  height = rotate == 0 || rotate == 180 ? dh : dw;
+  *width = rotate == 0 || rotate == 180 ? dw : dh;
+  *height = rotate == 0 || rotate == 180 ? dh : dw;
+}
 
-  if (self->texture_sw != NULL) {
-    // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
-    // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect ratio.
-    if (height >= SW_RENDERING_MAX_HEIGHT) {
-      return SW_RENDERING_MAX_HEIGHT;
-    }
-    if (width >= SW_RENDERING_MAX_WIDTH) {
-      return height / width * SW_RENDERING_MAX_WIDTH;
-    }
+void video_output_get_size(VideoOutput* self, gint64* width, gint64* height) {
+  if (self->width) {
+    // Fixed size.
+    *width = self->width;
+    *height = self->height;
+  } else {
+    // Video resolution dependent size.
+    video_output_get_video_size(self, width, height);
   }
-
-  return height;
+  if (self->texture_sw != NULL) {
+    video_output_fit_sw_size(width, height);
+  }
 }
 
 gint64 video_output_get_texture_id(VideoOutput* self) {
@@ -484,8 +440,8 @@ gint64 video_output_get_texture_id(VideoOutput* self) {
 
 void video_output_notify_texture_update(VideoOutput* self) {
   gint64 id = video_output_get_texture_id(self);
-  gint64 width = video_output_get_width(self);
-  gint64 height = video_output_get_height(self);
+  gint64 width = 0, height = 0;
+  video_output_get_size(self, &width, &height);
   gpointer context = self->texture_update_callback_context;
   if (self->texture_update_callback != NULL) {
     self->texture_update_callback(id, width, height, context);

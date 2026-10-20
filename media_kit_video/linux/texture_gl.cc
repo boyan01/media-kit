@@ -132,8 +132,10 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
   TextureGL* self = TEXTURE_GL(texture);
   VideoOutput* video_output = self->video_output;
   
-  gint32 required_width = (guint32)video_output_get_width(video_output);
-  gint32 required_height = (guint32)video_output_get_height(video_output);
+  gint64 video_width = 0, video_height = 0;
+  video_output_get_size(video_output, &video_width, &video_height);
+  gint32 required_width = (gint32)video_width;
+  gint32 required_height = (gint32)video_height;
   
   if (required_width > 0 && required_height > 0) {
     gboolean first_frame = self->name == 0 || self->fbo == 0 || self->mpv_texture == 0;

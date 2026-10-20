@@ -100,9 +100,11 @@ EGLSurface video_output_get_egl_surface(VideoOutput* self);
 
 guint8* video_output_get_pixel_buffer(VideoOutput* self);
 
-gint64 video_output_get_width(VideoOutput* self);
-
-gint64 video_output_get_height(VideoOutput* self);
+/**
+ * @brief Returns the current texture size. Both dimensions are read together
+ * so that they always belong to the same video frame size.
+ */
+void video_output_get_size(VideoOutput* self, gint64* width, gint64* height);
 
 gint64 video_output_get_texture_id(VideoOutput* self);
 
