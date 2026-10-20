@@ -179,7 +179,8 @@ void VideoOutput::Render() {
           static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->width),
           static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->height),
       };
-      auto pitch = 4 * size[0];
+      // mpv reads MPV_RENDER_PARAM_SW_STRIDE as size_t*.
+      size_t pitch = 4 * static_cast<size_t>(size[0]);
       mpv_render_param params[]{
           {MPV_RENDER_PARAM_SW_SIZE, size},
           {MPV_RENDER_PARAM_SW_FORMAT, "rgb0"},
