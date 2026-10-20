@@ -85,9 +85,9 @@ class VideoOutput {
 
   void Resize(int64_t required_width, int64_t required_height);
 
-  int64_t GetVideoWidth();
-
-  int64_t GetVideoHeight();
+  // Reads width & height together, so that both belong to the same
+  // video-out-params.
+  void GetVideoSize(int64_t& width, int64_t& height);
 
   std::optional<int64_t> height_ = std::nullopt;
   std::optional<int64_t> width_ = std::nullopt;
