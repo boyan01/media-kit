@@ -433,7 +433,10 @@ const guint8* video_output_render_sw(VideoOutput* self,
     int block_for_target_time = 0;
     mpv_render_param params[]{
         {MPV_RENDER_PARAM_SW_SIZE, size},
-        {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
+        // Flutter uploads the buffer as GL_RGBA, so the 4th byte must be an
+        // opaque alpha; "rgb0" leaves it 0 & the frame blends with the
+        // widgets behind the texture.
+        {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgba"},
         {MPV_RENDER_PARAM_SW_STRIDE, &pitch},
         {MPV_RENDER_PARAM_SW_POINTER, self->pixel_buffer},
         {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block_for_target_time},
