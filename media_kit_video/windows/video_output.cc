@@ -132,6 +132,10 @@ VideoOutput::VideoOutput(int64_t handle,
 
 VideoOutput::~VideoOutput() {
   destroyed_ = true;
+  // Make sure that mpv no longer invokes |NotifyRender| on this object.
+  if (render_context_ != nullptr) {
+    mpv_render_context_set_update_callback(render_context_, nullptr, nullptr);
+  }
   auto promise = std::promise<void>();
   if (texture_id_) {
     registrar_->texture_registrar()->UnregisterTexture(
