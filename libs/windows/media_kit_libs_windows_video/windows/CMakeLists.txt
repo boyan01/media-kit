@@ -163,6 +163,7 @@ if(NOT ANGLE_SRC_VALID)
     message(STATUS "7zip not found, falling back to CMake tar")
     add_custom_command(
       TARGET "${PROJECT_NAME}_ANGLE_EXTRACT"
+      POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E tar xzf "\"${ANGLE_ARCHIVE}\""
       WORKING_DIRECTORY "${ANGLE_SRC}"
     )
